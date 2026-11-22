@@ -266,3 +266,21 @@ def trace_payload(trace: Trace, slow_ms: int, decision: dict[str, Any]) -> dict[
             for s in sorted(trace.spans, key=lambda x: (x["start_ms"], x["id"]))
         ],
     }
+
+
+def trace_record_fields(trace: Trace) -> dict[str, Any]:
+    """Facts that must survive purging of the raw span rows."""
+    return {
+        "trace_id": trace.trace_id,
+        "services": trace.services,
+        "span_count": len(trace.spans),
+        "latency_ms": trace.latency_ms,
+        "start_ms": trace.start_ms,
+        "has_error": trace.has_error,
+        "has_timeout": trace.has_timeout,
+        "late_span_count": trace.late_span_count,
+    }
+
+
+TIER_LABELS = ("错误/超时", "慢请求", "普通")
+

@@ -16,7 +16,9 @@
 6. 在**宽限期**内投递迟到 span，观察尚未导出的决策如何被翻转；已导出的链路
    **不会重复导出**，最终保留结果也不会突破任何配额；
 7. 页面逐条展示每条链路的**保留 / 丢弃 / 等待原因**以及各服务**配额占用**；
-8. 所有状态持久化在 SQLite，**重启后可继续未完成的窗口**。
+8. 所有状态持久化在 SQLite，**重启后可继续未完成的窗口**；
+9. 从历史页**清理已关闭窗口的 span 明细**以释放 SQLite 存储，清理前或清理进行中可
+   **保全**排障要用的链路，清理**按整条链路分批**进行，批次之间当前窗口仍能接收 span。
 
 ## 目录结构
 
@@ -30,8 +32,8 @@
 │   ├── demo.py              # 四个一键演示场景
 │   └── static/              # 单页前端（index.html / app.js / styles.css）
 ├── tests/
-│   ├── test_sampler.py      # 14 项端到端单测（假时钟，确定性）
-│   └── smoke_http.py        # 对真实运行服务的 25 项 HTTP 冒烟检查
+│   ├── test_sampler.py      # 24 项端到端单测（假时钟，确定性）
+│   └── smoke_http.py        # 对真实运行服务的 49 项 HTTP 冒烟检查
 ├── run.py                   # 入口（自带 sys.path 处理，支持 python -I）
 ├── Dockerfile               # python:3.11-slim，无需 pip install
 ├── docker-compose.yml       # 一条命令起服务，SQLite 挂在命名卷
@@ -68,6 +70,11 @@ DB_PATH=./data/tracing.db PORT=8080 python3 -I run.py
 | 宽限期内迟到 span 可改变**暂定**决策；关闭后才最终落库 | `tentative_evaluation` + `_finalize_locked` |
 | 已导出链路幂等：重新结束窗口不产生重复导出，且仍占用配额 | `exports` 表主键 `(window_id, trace_id)` + 已导出槽位恢复 |
 | 重启恢复未完成窗口 | 全部状态在 SQLite；`AppState` 重建后 `advance()` 自动补关闭 |
+| 关闭时快照决策，清理后历史仍完整 | `_finalize_locked` 写 `trace_records` + `quota_usage` |
+| 清理按整条链路分批、每批单独提交 | `_run_purge_job` → `Storage.purge_trace_batch` |
+| 保全优先，已清理不可再保全 | `preserve` 校验 `purged_at_ms`；删除 SQL 排除 preserved |
+| 中断可重试、已提交批次继续生效 | `purge_jobs` 持久化；重启把 `running` 标为 `interrupted` |
+| 明细删除后重复 span_id 仍判重 | 去重查 `span_registry`（不随明细清理） |
 
 窗口三个阶段（页面顶部有进度条）：
 
@@ -86,10 +93,26 @@ DB_PATH=./data/tracing.db PORT=8080 python3 -I run.py
 
 页面上还有「立即结束并导出」「模拟进程重启（从 SQLite 恢复）」「清空全部数据」。
 
+## 明细保全与清理
+
+历史页/当前页点击任一链路行的「保全」，即可把该链路标记为排障保留；清理任务
+会跳过它并保留全部 span 明细。对已关闭窗口点击「清理 span 明细（按链路分批）」：
+
+1. 清理**按整条链路**分批删除，每批在一个事务里提交（span 明细 + `purged_at_ms`
+   标记同时生效），任务进度持久化在 `purge_jobs`；
+2. 批次之间不持有数据库锁、并按 `pause_ms` 间隔，因此**当前窗口仍可接收新 span**；
+3. 「模拟清理中断」或进程重启会把运行中的任务标为 `interrupted`，**已提交的批次
+   继续生效**，再次点击清理会从未清理的链路继续；
+4. 明细已清理的链路仍显示清理前的**采样决定、原因、原始 span 数、服务配额用量和
+   导出记录**（来自 `trace_records` / `quota_usage`），但**无法再保全**（提示原因）；
+5. 历史页用「明细已清理」标出这些链路；
+6. 去重改为查独立的 `span_registry`，所以**即使原明细已删除，相同 span_id 仍算重复上报**。
+   只有「清空全部数据」会连注册表一起清掉。
+
 ## 自测
 
 ```bash
-# 14 项确定性单测（假时钟驱动 collecting→grace→closed 全流程）
+# 24 项确定性单测（假时钟驱动 collecting→grace→closed 全流程，含保全/清理）
 python3 -I tests/test_sampler.py
 
 # HTTP 冒烟（先起服务）
@@ -99,7 +122,8 @@ python3 -I tests/smoke_http.py http://127.0.0.1:8091
 
 覆盖：乱序 span、迟到错误翻转、配额硬上限、跨服务原子性、重启恢复、
 幂等导出、关闭后拒 span、重复 span 幂等、默认配额、慢请求优先、运行中
-调配额、输入校验、演示场景装载。
+调配额、输入校验、演示场景装载、**明细分批清理、保全跳过清理、清理后历史与
+配额可见、已清理链路的保全被拒、中断后重试、清理期间接收新 span、清理后重复上报判重**。
 
 ## 主要 API
 
@@ -109,8 +133,12 @@ POST /api/windows/<id>/quotas         运行中调整某服务配额
 POST /api/windows/<id>/finalize       立即结束窗口并导出（幂等）
 POST /api/spans                       提交 span（时间戳由调用方给）
 GET  /api/window/current              当前/最近窗口的完整快照（含每条链路原因与配额占用）
-GET  /api/windows/<id>                任意窗口详情（含已关闭窗口）
-GET  /api/windows                     历史窗口
+GET  /api/windows/<id>                任意窗口详情（含已关闭、已清理窗口）
+GET  /api/windows                     历史窗口（含明细是否已清理）
+POST /api/windows/<id>/preserve       保全一条链路 {"trace_id":"..."}
+POST /api/windows/<id>/purge          启动/重试分批清理 {"batch_size":5,"pause_ms":0}
+GET  /api/windows/<id>/purge/status   清理任务进度与剩余链路/span
+POST /api/windows/<id>/purge/interrupt 模拟清理中断（已提交批次保留）
 POST /api/demo/<name>                 演示场景：out-of-order | late-error | quota-exhausted | multi-service
 POST /api/simulate-restart            关闭并重开 Storage，模拟进程重启
 POST /api/reset                       清空全部数据

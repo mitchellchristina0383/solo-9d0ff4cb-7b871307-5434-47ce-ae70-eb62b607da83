@@ -87,6 +87,10 @@
   <!-- ===================== 当前窗口状态 ===================== -->
   <section class="card">
     <h2>④ 当前窗口状态</h2>
+    <div id="pinned-banner" class="pinned-banner hidden">
+      <span id="pinned-label"></span>
+      <button class="mini" onclick="unpin()">返回当前窗口</button>
+    </div>
     <div id="window-panel"><p class="hint">尚未创建窗口。</p></div>
   </section>
 
@@ -108,9 +112,28 @@
     <div id="export-panel"><p class="hint">窗口关闭后展示。</p></div>
   </section>
 
+  <!-- ===================== 明细保全与清理 ===================== -->
+  <section class="card">
+    <h2>⑧ 明细保全与清理（释放 SQLite 存储）</h2>
+    <p class="hint">排障要用的链路可先点链路行的「保全」按钮；清理按整条链路分批删除 span 明细，批次之间当前窗口仍可接收 span。明细已清理的链路无法再保全，但其采样决定、原因、原始 span 数、配额用量与导出记录继续保留。</p>
+    <div class="grid">
+      <label>每批链路数
+        <input type="number" id="batch-size" value="2" min="1" step="1">
+      </label>
+      <label>批次间隔 (ms，便于观察交错)
+        <input type="number" id="batch-pause" value="0" min="0" step="100">
+      </label>
+    </div>
+    <div class="actions">
+      <button id="btn-purge" class="secondary" disabled>清理 span 明细（按链路分批）</button>
+      <button id="btn-interrupt" class="danger" disabled>模拟清理中断</button>
+    </div>
+    <div id="purge-panel" class="purge-panel"><p class="hint">窗口关闭后可清理。</p></div>
+  </section>
+
   <!-- ===================== 历史窗口 ===================== -->
   <section class="card">
-    <h2>⑧ 历史窗口</h2>
+    <h2>⑨ 历史窗口</h2>
     <div id="history-panel"><p class="hint">加载中…</p></div>
   </section>
 </main>

@@ -92,6 +92,26 @@ class WorkbenchHarness:
     def finalize(self, wid):
         return self.request("POST", f"/api/windows/{wid}/finalize", {})
 
+    def preserve(self, wid, trace_id):
+        return self.request("POST", f"/api/windows/{wid}/preserve",
+                            {"trace_id": trace_id})
+
+    def purge(self, wid, batch_size=2, pause_ms=0):
+        return self.request("POST", f"/api/windows/{wid}/purge",
+                            {"batch_size": batch_size, "pause_ms": pause_ms})
+
+    def purge_status(self, wid):
+        return self.request("GET", f"/api/windows/{wid}/purge/status")[1]
+
+    def wait_purge_done(self, wid, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            st = self.purge_status(wid)
+            if st["job"] and st["job"]["status"] != "running":
+                return st
+            time.sleep(0.05)
+        self.fail("清理任务未在超时内结束")
+
 
 class TailSamplingTests(unittest.TestCase):
     def setUp(self):
@@ -365,6 +385,192 @@ class TailSamplingTests(unittest.TestCase):
         self.h.request("GET", "/api/window/current")
         self.assertEqual(self.h.current()["window"]["status"], "closed")
         self.assertEqual(self.h.decisions()["T-b"]["decision"], "keep")
+
+    # =================================================== cleanup / preserve
+    def _closed_window_with_traces(self, quotas=None, default_quota=3,
+                                   collect=2000, grace=1000):
+        """Create + fill + close a window; return (wid, base)."""
+        _, snap = self.h.create_window(
+            collect=collect, grace=grace, slow=500,
+            default_quota=default_quota, quotas=quotas or {},
+        )
+        wid, base = snap["window"]["id"], snap["window"]["start_ms"]
+        return wid, base
+
+    def test_16_purge_removes_details_but_keeps_decisions(self):
+        wid, base = self._closed_window_with_traces(
+            default_quota=3, quotas={"gateway": 1})
+        self.h.span("p1", "T-keep", "gateway", base + 10, 20)
+        self.h.span("p2", "T-drop", "gateway", base + 30, 20)
+        self.h.span("p3", "T-drop", "orders", base + 40, 30)
+        self.h.clock.advance(3100)
+        self.h.request("POST", f"/api/windows/{wid}/finalize", {})
+        before = self.h.request("GET", f"/api/windows/{wid}")[1]
+        self.assertFalse(before["window"]["details_purged"])
+        self.assertEqual(before["original_span_count"], 3)
+
+        code, _ = self.h.purge(wid, batch_size=1)
+        self.assertEqual(code, 202)
+        st = self.h.wait_purge_done(wid)
+        self.assertEqual(st["job"]["status"], "completed")
+        self.assertEqual(st["job"]["purged_traces"], 2)
+        self.assertEqual(st["remaining_spans"], 0)
+
+        after = self.h.request("GET", f"/api/windows/{wid}")[1]
+        self.assertTrue(after["window"]["details_purged"])
+        self.assertEqual(after["span_count"], 0)
+        # Original span count and decision metadata survive.
+        self.assertEqual(after["original_span_count"], 3)
+        decisions = {t["trace_id"]: t for t in after["traces"]}
+        self.assertEqual(set(decisions), {"T-keep", "T-drop"})
+        for t in decisions.values():
+            self.assertTrue(t["details_purged"])
+            self.assertEqual(t["spans"], [])
+        self.assertEqual(decisions["T-keep"]["decision"], "keep")
+        self.assertEqual(decisions["T-drop"]["decision"], "drop_quota")
+        self.assertEqual(decisions["T-drop"]["span_count"], 2)
+        self.assertEqual(decisions["T-keep"]["span_count"], 1)
+        # Quota usage and exports survive too.
+        gw = next(q for q in after["quotas"] if q["service"] == "gateway")
+        self.assertEqual((gw["used"], gw["quota"]), (1, 1))
+        self.assertEqual({e["trace_id"] for e in after["exports"]}, {"T-keep"})
+
+    def test_17_preserved_trace_keeps_details(self):
+        wid, base = self._closed_window_with_traces(default_quota=3)
+        self.h.span("s1", "T-safe", "gateway", base + 10, 20)
+        self.h.span("s2", "T-gone", "gateway", base + 30, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        code, body = self.h.preserve(wid, "T-safe")
+        self.assertEqual(code, 200)
+        safe = next(t for t in body["traces"] if t["trace_id"] == "T-safe")
+        self.assertTrue(safe["preserved"])
+        self.h.purge(wid, batch_size=5)
+        self.h.wait_purge_done(wid)
+        detail = self.h.request("GET", f"/api/windows/{wid}")[1]
+        traces = {t["trace_id"]: t for t in detail["traces"]}
+        self.assertFalse(traces["T-safe"]["details_purged"])
+        self.assertEqual(len(traces["T-safe"]["spans"]), 1,
+                         "保全的链路必须保留完整明细")
+        self.assertTrue(traces["T-gone"]["details_purged"])
+        self.assertEqual(detail["span_count"], 1)
+
+    def test_18_cannot_preserve_after_details_purged(self):
+        wid, base = self._closed_window_with_traces(default_quota=3)
+        self.h.span("g1", "T-x", "gateway", base + 10, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        self.h.purge(wid)
+        self.h.wait_purge_done(wid)
+        code, body = self.h.preserve(wid, "T-x")
+        self.assertEqual(code, 409)
+        self.assertIn("无法再保全", body["error"])
+
+    def test_19_interrupted_purge_resumes_and_commits_stay(self):
+        wid, base = self._closed_window_with_traces(default_quota=10)
+        # Five single-span traces so batches are observable.
+        for i in range(5):
+            self.h.span(f"t{i}", f"T-{i}", "gateway", base + 10 * i, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        # Large batch + pause so the first batch commits, then we interrupt.
+        code, _ = self.h.purge(wid, batch_size=1, pause_ms=250)
+        self.assertEqual(code, 202)
+        time.sleep(0.4)  # first batch has committed, worker is sleeping
+        code, _ = self.h.request(
+            "POST", f"/api/windows/{wid}/purge/interrupt", {})
+        self.assertEqual(code, 200)
+        st = self.h.purge_status(wid)
+        self.assertEqual(st["job"]["status"], "interrupted")
+        committed = st["job"]["purged_traces"]
+        self.assertGreaterEqual(committed, 1, "中断前至少提交一批")
+        self.assertLess(committed, 5)
+        span_after_interrupt = self.h.request(
+            "GET", f"/api/windows/{wid}")[1]["span_count"]
+        self.assertEqual(span_after_interrupt, 5 - committed)
+        # Retry: resumes from what is left; completed batches stay purged.
+        code, _ = self.h.purge(wid, batch_size=1, pause_ms=0)
+        self.assertEqual(code, 202)
+        st = self.h.wait_purge_done(wid)
+        self.assertEqual(st["job"]["status"], "completed")
+        self.assertEqual(st["remaining_spans"], 0)
+        detail = self.h.request("GET", f"/api/windows/{wid}")[1]
+        self.assertTrue(detail["window"]["details_purged"])
+        self.assertEqual(detail["original_span_count"], 5)
+
+    def test_20_duplicate_span_still_detected_after_purge(self):
+        wid, base = self._closed_window_with_traces(default_quota=3)
+        self.h.span("dup-purge", "T-d", "gateway", base + 10, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        self.h.purge(wid)
+        self.h.wait_purge_done(wid)
+        self.assertEqual(self.h.request(
+            "GET", f"/api/windows/{wid}")[1]["span_count"], 0)
+        # New window, same span_id re-reported -> still a duplicate.
+        _, snap2 = self.h.create_window(collect=2000, grace=1000)
+        base2 = snap2["window"]["start_ms"]
+        _, body = self.h.span("dup-purge", "T-new", "gateway", base2 + 10, 20)
+        self.assertTrue(body["duplicate"],
+                        "原明细已删除，相同 span_id 仍须判为重复")
+        self.assertEqual(self.h.current()["span_count"], 0)
+
+    def test_21_spans_accepted_between_purge_batches(self):
+        wid, base = self._closed_window_with_traces(default_quota=10)
+        for i in range(4):
+            self.h.span(f"o{i}", f"T-old-{i}", "gateway", base + 10 * i, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        self.h.purge(wid, batch_size=1, pause_ms=200)
+        # While cleanup is in progress, open a new window and submit a span.
+        self.h.clock.advance(100)
+        _, snap2 = self.h.create_window(collect=3000, grace=1000)
+        base2 = snap2["window"]["start_ms"]
+        code, body = self.h.span("live1", "T-live", "gateway", base2 + 5, 10)
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("span_accepted"))
+        self.h.wait_purge_done(wid)
+        self.assertEqual(self.h.current()["span_count"], 1)
+
+    def test_22_history_marks_purged_windows(self):
+        wid, base = self._closed_window_with_traces(default_quota=3)
+        self.h.span("h1", "T-h", "gateway", base + 10, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        self.h.purge(wid)
+        self.h.wait_purge_done(wid)
+        hist = self.h.request("GET", "/api/windows")[1]
+        row = next(w for w in hist["windows"] if w["id"] == wid)
+        self.assertTrue(row["details_purged"])
+        self.assertEqual(row["span_count"], 0)
+        self.assertEqual(row["original_span_count"], 1)
+        self.assertEqual(row["export_count"], 1)
+
+    def test_23_purge_requires_closed_window(self):
+        _, snap = self.h.create_window()
+        wid = snap["window"]["id"]
+        code, body = self.h.purge(wid)
+        self.assertEqual(code, 409)
+        self.assertIn("已关闭", body["error"])
+
+    def test_24_interrupted_job_marked_after_restart(self):
+        wid, base = self._closed_window_with_traces(default_quota=10)
+        for i in range(3):
+            self.h.span(f"r{i}", f"T-r-{i}", "gateway", base + 10 * i, 20)
+        self.h.clock.advance(3100)
+        self.h.finalize(wid)
+        self.h.purge(wid, batch_size=1, pause_ms=400)
+        time.sleep(0.3)
+        self.h.request("POST", "/api/simulate-restart", {})
+        st = self.h.purge_status(wid)
+        self.assertEqual(st["job"]["status"], "interrupted")
+        committed = st["job"]["purged_traces"]
+        self.assertGreaterEqual(committed, 1)
+        # Retry after restart completes the rest.
+        self.h.purge(wid, batch_size=1, pause_ms=0)
+        st = self.h.wait_purge_done(wid)
+        self.assertEqual(st["job"]["status"], "completed")
+        self.assertEqual(st["remaining_spans"], 0)
 
 
 if __name__ == "__main__":

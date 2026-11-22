@@ -128,6 +128,88 @@ print("== history ==")
 st, hist = call("GET", "/api/windows")
 check("history lists window", any(x["id"] == wid for x in hist["windows"]))
 
+print("== preserve before cleanup ==")
+# Preserve T1 (already exported) so its details must survive the purge.
+st, pres = call("POST", f"/api/windows/{wid}/preserve", {"trace_id": "T1"})
+check("preserve before purge 200", st == 200, str(st))
+t1 = next(t for t in pres["traces"] if t["trace_id"] == "T1")
+check("T1 flagged preserved", t1["preserved"] is True)
+
+print("== interrupted cleanup, then retry ==")
+st, job = call("POST", f"/api/windows/{wid}/purge",
+               {"batch_size": 1, "pause_ms": 1000})
+check("purge accepted 202", st == 202, str(st))
+time.sleep(0.4)  # first batch committed, worker sleeping between batches
+st, ip = call("POST", f"/api/windows/{wid}/purge/interrupt", {})
+check("interrupt 200", st == 200, str(st))
+st, before = call("GET", f"/api/windows/{wid}")
+remaining_before = before["span_count"]
+check("some details already purged before interruption",
+      0 < remaining_before < before["original_span_count"],
+      f"{remaining_before}/{before['original_span_count']}")
+# Wait out the sleep of the still-alive worker thread before retrying, so
+# the retry sees the job finished/interrupted rather than briefly 'running'.
+time.sleep(1.1)
+# A current window still accepts spans while cleanup is paused/interrupted.
+st, w2 = call("POST", "/api/windows", {
+    "collect_ms": 20000, "grace_ms": 5000, "slow_ms": 500,
+    "default_quota": 3, "quotas": {}})
+check("new window while cleanup interrupted", st == 201, str(st))
+base2 = w2["window"]["start_ms"]
+st, live = call("POST", "/api/spans", dict(
+    span_id="live-1", trace_id="T-live", service="gateway", operation="op",
+    start_ms=base2 + 5, duration_ms=10, status="ok"))
+check("span accepted during cleanup", st == 200 and live.get("span_accepted"))
+st, retry = call("POST", f"/api/windows/{wid}/purge",
+                 {"batch_size": 1, "pause_ms": 0})
+check("retry purge 202", st == 202, str(st))
+deadline = time.time() + 8
+while time.time() < deadline:
+    st, ps = call("GET", f"/api/windows/{wid}/purge/status")
+    if ps["job"] and ps["job"]["status"] == "completed":
+        break
+    time.sleep(0.2)
+check("cleanup completed after retry",
+      ps["job"]["status"] == "completed", str(ps["job"]))
+check("only preserved trace's spans remain", ps["remaining_spans"] == 4,
+      str(ps["remaining_spans"]))
+
+print("== purged window still answers history questions ==")
+st, detail = call("GET", f"/api/windows/{wid}")
+check("details_purged flag", detail["window"]["details_purged"] is True)
+check("original span count retained",
+      detail["original_span_count"] == before["original_span_count"])
+keep_t = next(t for t in detail["traces"] if t["trace_id"] == "T1")
+drop_t = next(t for t in detail["traces"] if t["trace_id"] == "T-multi")
+check("preserved trace keeps details", len(keep_t["spans"]) == 4,
+      str(len(keep_t["spans"])))
+check("purged trace keeps decision", drop_t["decision"] == "drop_quota")
+check("purged trace keeps reason", "配额" in drop_t["reason"])
+check("purged trace keeps original span count", drop_t["span_count"] == 3)
+check("purged trace has no span rows", drop_t["spans"] == [])
+check("quota usage retained after purge",
+      any(q["used"] == 1 and q["quota"] == 1
+          for q in detail["quotas"] if q["service"] == "payment"))
+check("exports retained after purge", len(detail["exports"]) == 1)
+st, err = call("POST", f"/api/windows/{wid}/preserve", {"trace_id": "T-multi"})
+check("preserve after purge rejected 409", st == 409, str(st))
+
+print("== duplicate span_id still detected after purge ==")
+st, dup2 = call("POST", "/api/spans", dict(
+    span_id="s1", trace_id="T-new", service="gateway", operation="op",
+    start_ms=base2 + 10, duration_ms=10, status="ok"))
+check("duplicate after purge flagged", dup2.get("duplicate") is True)
+st, cur2 = call("GET", "/api/window/current")
+check("duplicate after purge not stored", cur2["span_count"] == 1,
+      str(cur2["span_count"]))
+
+print("== history marks cleaned windows ==")
+st, hist2 = call("GET", "/api/windows")
+row = next(x for x in hist2["windows"] if x["id"] == wid)
+check("history marks details_purged", row["details_purged"] is True)
+check("history keeps original span count",
+      row["original_span_count"] == detail["original_span_count"])
+
 print("== simulate restart (reload from SQLite) ==")
 st, r = call("POST", "/api/simulate-restart", {})
 check("restart endpoint ok", st == 200 and r["startup_count"] == 2, str(r))
